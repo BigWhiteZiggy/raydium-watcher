@@ -1,0 +1,21 @@
+{
+  "name": "raydium-discord-watcher",
+  "version": "1.0.0",
+  "description": "Raydium pool watcher with Discord notifications",
+  "main": "raydium-to-discord.js",
+  "scripts": {
+    "start": "node raydium-to-discord.js",
+    "seed": "SEED_ONLY=1 node raydium-to-discord.js"
+  },
+  "keywords": [
+    "raydium",
+    "solana",
+    "discord",
+    "crypto"
+  ],
+  "author": "",
+  "license": "MIT",
+  "dependencies": {
+    "node-fetch": "^2.7.0"
+  }
+}
