@@ -1,9 +1,9 @@
 /**
  * Raydium Meme Hunter (Solana) — Discord alerts
  *
- * FINAL VERSION - ALL FIXES INCLUDED:
+ * UPDATED VERSION - DISCOVERY FIX + RUG FILTERS + LAUNCH/RUNNER ALERTS:
  * ✅ Poll default = 60s (faster scanning)
- * ✅ MAX_AGE_HOURS = 168 (7 days for more coverage)
+ * ✅ MAX_AGE_HOURS = 72 (3 days discovery window by default)
  * ✅ DexScreener pairCreatedAt normalized (handles seconds/ms)
  * ✅ Accepts raydium + raydium-clmm dex IDs
  * ✅ Hybrid discovery with fallback
@@ -18,6 +18,9 @@
 const fs = require("fs");
 const path = require("path");
 
+const BUILD_ID = "discoveryfix-unified-v2";
+console.log("✅ BUILD CHECK:", BUILD_ID, new Date().toISOString());
+
 const DISCORD_WEBHOOK_URL = process.env.DISCORD_WEBHOOK_URL;
 if (!DISCORD_WEBHOOK_URL) {
   console.error("Missing DISCORD_WEBHOOK_URL env var.");
@@ -26,29 +29,47 @@ if (!DISCORD_WEBHOOK_URL) {
 
 const STATE_FILE = path.join(__dirname, "state.json");
 
+
+// Alert Tracks
+const ALERT_LAUNCH_GEMS = process.env.ALERT_LAUNCH_GEMS !== "0";
+const ALERT_RUNNERS = process.env.ALERT_RUNNERS !== "0";
+
+// Optional separate Discord channels
+const DISCORD_WEBHOOK_URL_LAUNCH = process.env.DISCORD_WEBHOOK_URL_LAUNCH || DISCORD_WEBHOOK_URL;
+const DISCORD_WEBHOOK_URL_RUNNERS = process.env.DISCORD_WEBHOOK_URL_RUNNERS || DISCORD_WEBHOOK_URL;
+
 // Config
-const POLL_MS = Number(process.env.POLL_MS || 60000);
-const MAX_ANALYZE = Number(process.env.MAX_ANALYZE || 40);
-const ALERT_TOP_N = Number(process.env.ALERT_TOP_N || 10);
-const MAX_AGE_HOURS = Number(process.env.MAX_AGE_HOURS || 168);
-const MIN_AGE_MINUTES = Number(process.env.MIN_AGE_MINUTES || 5);
-const WATCH_DAYS = Number(process.env.WATCH_DAYS || 3);
+const POLL_MS = Number(process.env.POLL_MS || 60000); // 60s default
+const MAX_ANALYZE = Number(process.env.MAX_ANALYZE || 80);
+const ALERT_TOP_N = Number(process.env.ALERT_TOP_N || 15);
+const MAX_AGE_HOURS = Number(process.env.MAX_AGE_HOURS || 72); // 3 days discovery window by default
+const MIN_AGE_MINUTES = Number(process.env.MIN_AGE_MINUTES || 2);
+const WATCH_DAYS = Number(process.env.WATCH_DAYS || 3); // watch coins for 3 days
 const WATCH_HOURS = WATCH_DAYS * 24;
 const PUMP_CHECK_LIMIT = Number(process.env.PUMP_CHECK_LIMIT || 100);
-const MIN_LIQ_USD = Number(process.env.MIN_LIQ_USD || 2500);
-const MIN_VOL_24H_USD = Number(process.env.MIN_VOL_24H_USD || 1500);
-const MAX_MARKETCAP_USD = Number(process.env.MAX_MARKETCAP_USD || 5_000_000);
+const MIN_LIQ_USD = Number(process.env.MIN_LIQ_USD || 1200);
+const MIN_VOL_24H_USD = Number(process.env.MIN_VOL_24H_USD || 500);
+const MAX_MARKETCAP_USD = Number(process.env.MAX_MARKETCAP_USD || 10_000_000);
 const SEEN_TTL_DAYS = Number(process.env.SEEN_TTL_DAYS || 14);
+
+// --- Solana Rug Filters (Helius RPC) ---
+const HELIUS_API_KEY = process.env.HELIUS_API_KEY || "";
+const HELIUS_RPC_URL = process.env.HELIUS_RPC_URL || (HELIUS_API_KEY ? `https://mainnet.helius-rpc.com/?api-key=${HELIUS_API_KEY}` : "");
+const ENABLE_RUG_FILTERS = process.env.ENABLE_RUG_FILTERS !== "0";
+const BLOCK_IF_MINT_AUTHORITY = process.env.BLOCK_IF_MINT_AUTHORITY !== "0";
+const BLOCK_IF_FREEZE_AUTHORITY = process.env.BLOCK_IF_FREEZE_AUTHORITY !== "0";
+const TOPHOLDERS_COUNT = Number(process.env.TOPHOLDERS_COUNT || 10);
+const TOPHOLDERS_MAX_PCT = Number(process.env.TOPHOLDERS_MAX_PCT || 55);
+
 const NEW_ALERT_COOLDOWN_HOURS = Number(process.env.NEW_ALERT_COOLDOWN_HOURS || 12);
 const PUMP_ALERT_COOLDOWN_HOURS = Number(process.env.PUMP_ALERT_COOLDOWN_HOURS || 6);
-const PUMP_5M_PCT = Number(process.env.PUMP_5M_PCT || 25);
-const PUMP_VOL_MULT = Number(process.env.PUMP_VOL_MULT || 2.5);
-const PUMP_BUYSELL_RATIO = Number(process.env.PUMP_BUYSELL_RATIO || 1.8);
-const PUMP_MIN_H1_TXNS = Number(process.env.PUMP_MIN_H1_TXNS || 20);
+const PUMP_MON_5M_PCT = Number(process.env.PUMP_MON_5M_PCT || 8);
+const PUMP_MON_VOL_MULT = Number(process.env.PUMP_MON_VOL_MULT || 2.5);
+const PUMP_MON_BUYSELL_RATIO = Number(process.env.PUMP_MON_BUYSELL_RATIO || 1.8);
+const PUMP_MON_MIN_H1_TXNS = Number(process.env.PUMP_MON_MIN_H1_TXNS || 20);
 
-const DEX_PAIRS_SOLANA = "https://api.dexscreener.com/latest/dex/pairs/solana";
 const DEX_TOKEN_DETAILS = (addr) => `https://api.dexscreener.com/latest/dex/tokens/${addr}`;
-const RAYDIUM_DEX_IDS = new Set(["raydium", "raydium-clmm"]);
+const DEX_IDS = new Set(["raydium", "raydium-clmm", "orca", "meteora"]);
 const POPULAR_TOKENS = [
   "So11111111111111111111111111111111111111112",
   "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v",
@@ -137,8 +158,76 @@ function canSendCooldown(lastAt, cooldownHours) {
   return !lastAt || hoursAgo(lastAt) >= cooldownHours;
 }
 
-async function postToDiscord({ title, description, fields = [], color = 0x00ff00 }) {
-  const res = await fetch(DISCORD_WEBHOOK_URL, {
+// ---------- Helius RPC + Rug Checks ----------
+async function rpc(method, params = []) {
+  if (!HELIUS_RPC_URL) return null;
+  const res = await fetch(HELIUS_RPC_URL, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ jsonrpc: "2.0", id: "1", method, params }),
+  });
+  if (!res.ok) return null;
+  const data = await res.json().catch(() => null);
+  return data?.result ?? null;
+}
+
+async function getMintAuthorities(mintAddr) {
+  const result = await rpc("getAccountInfo", [
+    mintAddr,
+    { encoding: "jsonParsed", commitment: "confirmed" },
+  ]);
+  const info = result?.value?.data?.parsed?.info;
+  if (!info) return { ok: false, mintAuthority: null, freezeAuthority: null };
+  return {
+    ok: true,
+    mintAuthority: info.mintAuthority ?? null,
+    freezeAuthority: info.freezeAuthority ?? null,
+  };
+}
+
+async function getTopHoldersPct(mintAddr) {
+  const largest = await rpc("getTokenLargestAccounts", [mintAddr]);
+  const list = Array.isArray(largest?.value) ? largest.value : [];
+
+  const supplyRes = await rpc("getTokenSupply", [mintAddr]);
+  const supply = Number(supplyRes?.value?.amount || 0);
+  if (!supply) return { ok: false, pct: null, used: 0 };
+
+  let sum = 0;
+  let used = 0;
+  for (const acct of list) {
+    const amt = Number(acct?.amount || 0);
+    if (!amt) continue;
+    sum += amt;
+    used++;
+    if (used >= TOPHOLDERS_COUNT) break;
+  }
+  return { ok: true, pct: (sum / supply) * 100, used };
+}
+
+async function rugCheck(token) {
+  if (!ENABLE_RUG_FILTERS) return { ok: true, reasons: [] };
+  if (!HELIUS_RPC_URL) return { ok: true, reasons: ["⚠️ Rug filters enabled but HELIUS_RPC_URL/HELIUS_API_KEY not set"] };
+
+  const reasons = [];
+
+  const auth = await getMintAuthorities(token.address);
+  if (auth.ok) {
+    if (BLOCK_IF_MINT_AUTHORITY && auth.mintAuthority) reasons.push("🚫 Mint authority exists");
+    if (BLOCK_IF_FREEZE_AUTHORITY && auth.freezeAuthority) reasons.push("🚫 Freeze authority exists");
+  }
+
+  const holders = await getTopHoldersPct(token.address);
+  if (holders.ok && holders.pct != null && holders.pct > TOPHOLDERS_MAX_PCT) {
+    reasons.push(`🚫 Top ${TOPHOLDERS_COUNT} holders too concentrated (${holders.pct.toFixed(1)}%)`);
+  }
+
+  return { ok: reasons.length === 0, reasons, meta: { auth, holders } };
+}
+// -------------------------------------------
+
+async function postToDiscord({ title, description, fields = [], color = 0x00ff00, webhookUrl = DISCORD_WEBHOOK_URL }) {
+  const res = await fetch(webhookUrl, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({
@@ -157,100 +246,129 @@ async function postToDiscord({ title, description, fields = [], color = 0x00ff00
   }
 }
 
+// ---------- Heartbeat / Health ----------
+const HEARTBEAT_MIN = Number(process.env.HEARTBEAT_MIN || 60); // send "alive" ping every N minutes
+let _lastHeartbeatAt = 0;
+
+async function maybeHeartbeat(extra = {}) {
+  const now = Date.now();
+  const everyMs = HEARTBEAT_MIN * 60 * 1000;
+  if (_lastHeartbeatAt && (now - _lastHeartbeatAt) < everyMs) return;
+
+  _lastHeartbeatAt = now;
+  const fields = [
+    { name: "⏱️ Poll", value: `${Math.round(POLL_MS/1000)}s`, inline: true },
+    { name: "🕒 Now", value: new Date().toISOString(), inline: true },
+  ];
+
+  if (extra?.watchSize != null) fields.push({ name: "👀 Watch", value: String(extra.watchSize), inline: true });
+  if (extra?.seenSize != null) fields.push({ name: "🗂️ Seen", value: String(extra.seenSize), inline: true });
+
+  await postToDiscord({
+    title: "✅ Meme Hunter Heartbeat",
+    description: "Bot is running and scanning.",
+    fields,
+    color: 0x2ecc71,
+  });
+}
+
 async function fetchRecentRaydiumPairs() {
+  /**
+   * Discovery (FIXED):
+   * DexScreener does not provide a stable "all Solana pairs" endpoint.
+   * The old /latest/dex/pairs/solana call can 404 depending on environment/routing.
+   *
+   * New approach:
+   * 1) Use DexScreener public discovery feeds (boosts/profiles) to get fresh + trending token addresses.
+   * 2) Enrich each token via /latest/dex/tokens/{addr} and then pick the best eligible pair (Raydium/Orca/Meteora).
+   * 3) (Fallback) Seed from POPULAR_TOKENS token pages.
+   *
+   * Output is a list of candidate token addresses. scanForGems() will enrich details.
+   */
   const now = Date.now();
   const maxAgeMs = MAX_AGE_HOURS * 3600000;
   const minAgeMs = MIN_AGE_MINUTES * 60000;
 
+  const out = [];
+  const seen = new Set();
+
+  // 1) Trending / discovery feeds (best coverage)
   try {
-    console.log("Trying primary DexScreener feed...");
-    const res = await fetch(DEX_PAIRS_SOLANA);
-    if (res.ok) {
-      const data = await res.json();
-      const pairs = Array.isArray(data?.pairs) ? data.pairs : [];
-      const filtered = pairs
-        .filter(p => p?.chainId === "solana" && RAYDIUM_DEX_IDS.has(p?.dexId))
-        .map(p => {
-          const createdAt = normalizePairCreatedAt(p?.pairCreatedAt);
-          return createdAt ? { p, createdAt } : null;
-        })
-        .filter(Boolean)
-        .filter(({ createdAt }) => {
-          const ageMs = now - createdAt;
-          return ageMs <= maxAgeMs && ageMs >= minAgeMs;
-        });
-
-      const capped = filtered.slice(0, 3000);
-      capped.sort((a, b) => (b.p?.liquidity?.usd || 0) - (a.p?.liquidity?.usd || 0));
-
-      const candidates = [];
-      const seen = new Set();
-      for (const { p } of capped) {
-        const addr = p?.baseToken?.address;
-        if (!addr || seen.has(addr)) continue;
-        seen.add(addr);
-        candidates.push({ address: addr, fromPair: p });
-        if (candidates.length >= 300) break;
-      }
-
-      console.log(`  ✅ Primary: ${candidates.length} candidates`);
-      if (candidates.length) return candidates;
-    } else {
-      console.log(`  ⚠️ Primary: ${res.status}`);
+    console.log("Trying DexScreener discovery feeds (boosts/profiles)...");
+    const addrs = await fetchTrendingCandidates();
+    console.log(`  ✅ Discovery feeds: ${addrs.length} candidates`);
+    for (const addr of addrs) {
+      if (!addr || seen.has(addr)) continue;
+      seen.add(addr);
+      out.push({ address: addr, fromPair: null, source: "discovery" });
+      if (out.length >= 300) break;
     }
   } catch (e) {
-    console.log(`  ⚠️ Primary failed: ${e.message}`);
+    console.log(`  ⚠️ Discovery feeds failed: ${e.message}`);
   }
 
-  console.log("Falling back to popular tokens...");
-  const allPairs = [];
-  for (const baseToken of POPULAR_TOKENS) {
-    try {
-      const res = await fetch(DEX_TOKEN_DETAILS(baseToken));
-      if (!res.ok) {
-        console.log(`  ⚠️ ${baseToken.slice(0, 8)}: ${res.status}`);
-        continue;
+  // 2) Fallback: seed from popular tokens' token pages
+  if (out.length < 60) {
+    console.log("Falling back to popular token seeds...");
+    const allPairs = [];
+    for (const baseToken of POPULAR_TOKENS) {
+      try {
+        const res = await fetch(DEX_TOKEN_DETAILS(baseToken));
+        if (!res.ok) {
+          console.log(`  ⚠️ ${baseToken.slice(0, 8)}: ${res.status}`);
+          continue;
+        }
+        const data = await res.json();
+        const pairs = Array.isArray(data?.pairs) ? data.pairs : [];
+        const recent = pairs
+          .filter(p => p?.chainId === "solana" && DEX_IDS.has(p?.dexId))
+          .map(p => {
+            const createdAt = normalizePairCreatedAt(p?.pairCreatedAt);
+            return createdAt ? { p, createdAt } : null;
+          })
+          .filter(Boolean)
+          .filter(({ createdAt }) => {
+            const ageMs = now - createdAt;
+            return ageMs <= maxAgeMs && ageMs >= minAgeMs;
+          })
+          .map(({ p }) => p);
+
+        console.log(`  ✅ ${baseToken.slice(0, 8)}: ${recent.length} pairs`);
+        allPairs.push(...recent);
+      } catch (e) {
+        console.log(`  ⚠️ ${baseToken.slice(0, 8)}: ${e.message}`);
       }
-      const data = await res.json();
-      const pairs = Array.isArray(data?.pairs) ? data.pairs : [];
-      const raydiumRecent = pairs
-        .filter(p => p?.chainId === "solana" && RAYDIUM_DEX_IDS.has(p?.dexId))
-        .map(p => {
-          const createdAt = normalizePairCreatedAt(p?.pairCreatedAt);
-          return createdAt ? { p, createdAt } : null;
-        })
-        .filter(Boolean)
-        .filter(({ createdAt }) => {
-          const ageMs = now - createdAt;
-          return ageMs <= maxAgeMs && ageMs >= minAgeMs;
-        })
-        .map(({ p }) => p);
-
-      console.log(`  ✅ ${baseToken.slice(0, 8)}: ${raydiumRecent.length} pairs`);
-      allPairs.push(...raydiumRecent);
-    } catch (e) {
-      console.log(`  ⚠️ ${baseToken.slice(0, 8)}: ${e.message}`);
+      await sleep(150);
     }
-    await sleep(150);
+
+    // velocity-first sort
+    allPairs.sort((a, b) => {
+      const aTx = (a?.txns?.m5?.buys || 0) + (a?.txns?.m5?.sells || 0);
+      const bTx = (b?.txns?.m5?.buys || 0) + (b?.txns?.m5?.sells || 0);
+      if (bTx !== aTx) return bTx - aTx;
+
+      const aV = Number(a?.volume?.m5 || 0);
+      const bV = Number(b?.volume?.m5 || 0);
+      if (bV !== aV) return bV - aV;
+
+      return (b?.liquidity?.usd || 0) - (a?.liquidity?.usd || 0);
+    });
+
+    for (const p of allPairs) {
+      const addr = p?.baseToken?.address;
+      if (!addr || seen.has(addr)) continue;
+      seen.add(addr);
+      out.push({ address: addr, fromPair: p, source: "popular_seed" });
+      if (out.length >= 300) break;
+    }
   }
 
-  allPairs.sort((a, b) => (b?.liquidity?.usd || 0) - (a?.liquidity?.usd || 0));
-  const candidates = [];
-  const seen = new Set();
-  for (const p of allPairs) {
-    const addr = p?.baseToken?.address;
-    if (!addr || seen.has(addr)) continue;
-    seen.add(addr);
-    candidates.push({ address: addr, fromPair: p });
-    if (candidates.length >= 300) break;
-  }
-
-  console.log(`  ✅ Fallback: ${candidates.length} candidates`);
-  return candidates;
+  console.log(`  ✅ Discovery total: ${out.length} candidates`);
+  return out;
 }
 
 function pickBestPair(pairs, preferredPairAddress) {
-  const solRay = pairs.filter(p => p?.chainId === "solana" && RAYDIUM_DEX_IDS.has(p?.dexId));
+  const solRay = pairs.filter(p => p?.chainId === "solana" && DEX_IDS.has(p?.dexId));
   if (!solRay.length) return null;
   if (preferredPairAddress) {
     const match = solRay.find(p => p?.pairAddress === preferredPairAddress);
@@ -362,12 +480,12 @@ function scoreEarlyGem(token) {
 
 function shouldTriggerPumpAlert(current, baseline) {
   if (!baseline) return false;
-  if (Number(current.priceChange5m || 0) >= PUMP_5M_PCT) return true;
+  if (Number(current.priceChange5m || 0) >= PUMP_MON_5M_PCT) return true;
   const baseVol = Number(baseline.volume24h || 0);
   const curVol = Number(current.volume24h || 0);
-  if (baseVol >= 1000 && curVol >= baseVol * PUMP_VOL_MULT) return true;
+  if (baseVol >= 1000 && curVol >= baseVol * PUMP_MON_VOL_MULT) return true;
   const { buys, sells, total } = getH1Txns(current);
-  if (total >= PUMP_MIN_H1_TXNS && sells > 0 && buys / sells >= PUMP_BUYSELL_RATIO) return true;
+  if (total >= PUMP_MON_MIN_H1_TXNS && sells > 0 && buys / sells >= PUMP_MON_BUYSELL_RATIO) return true;
   return false;
 }
 
@@ -446,6 +564,17 @@ async function scanForGems() {
       state.seenTokens[addr] = meta;
       continue;
     }
+
+    // Rug filters (Solana): mint/freeze authority + top holders concentration
+    const rug = await rugCheck(token);
+    await sleep(120);
+    if (!rug.ok) {
+      meta.status = "blocked_rug_filter";
+      meta.blockReasons = rug.reasons;
+      state.seenTokens[addr] = meta;
+      continue;
+    }
+
     token.score = scoreEarlyGem(token);
     token.risks = assessEarlyRisk(token);
     gems.push(token);
@@ -462,6 +591,10 @@ async function scanForGems() {
   gems.sort((a, b) => b.score - a.score);
   const top = gems.slice(0, ALERT_TOP_N);
   console.log(`🚀 Alerting ${top.length} gems...`);
+  if (!ALERT_LAUNCH_GEMS) {
+    console.log('  🚫 Launch gem alerts disabled (ALERT_LAUNCH_GEMS=0)');
+    return;
+  }
   for (const gem of top) {
     const ageH = getAgeHours(gem.pairCreatedAt);
     let color = 0x00ff00;
@@ -489,7 +622,7 @@ async function scanForGems() {
     fields.push({ name: "Token", value: `\`${gem.address}\``, inline: false });
     if (gem.pairAddress) fields.push({ name: "Pair", value: `\`${gem.pairAddress}\``, inline: false });
     if (gem.url) fields.push({ name: "Chart", value: gem.url, inline: false });
-    await postToDiscord({ title, description: `**${gem.symbol}** — ${gem.name}`, fields, color });
+    await postToDiscord({ title, description: `**${gem.symbol}** — ${gem.name}`, fields, color, webhookUrl: DISCORD_WEBHOOK_URL_LAUNCH });
     const st = loadState();
     const m = typeof st.seenTokens[gem.address] === "number" ? { firstSeenAt: st.seenTokens[gem.address] } : (st.seenTokens[gem.address] || {});
     m.lastAlertAt = Date.now();
@@ -504,6 +637,406 @@ async function scanForGems() {
   }
 }
 
+
+// ---------- Trending (DexScreener "what's hot" + our own marketcap/FDV deltas) ----------
+/**
+ * Adds "trending" alerts even for older tokens:
+ * - Discover candidates from DexScreener public feeds (boosts/profiles).
+ * - Put them into a watchlist (up to WATCH_DAYS).
+ * - Snapshot cap/liquidity/txns periodically and alert on acceleration.
+ *
+ * Controls (env):
+ *   TRENDING_ENABLED=1|0
+ *   TREND_MAX_WATCH=100
+ *   TREND_WINDOW_MIN=15
+ *   TREND_PCT_THRESHOLD=25
+ *   TREND_MIN_LIQ_USD=5000
+ *   TREND_MIN_VOL_24H_USD=5000
+ *   TREND_MIN_TXNS_1H=25
+ *   TREND_ALERT_COOLDOWN_MIN=45
+ *   TREND_HISTORY_MAX=120
+ */
+
+const TRENDING_ENABLED = process.env.TRENDING_ENABLED !== "0";
+
+// Public feeds (no API key)
+const DEX_TREND_BOOSTS_TOP = "https://api.dexscreener.com/token-boosts/top/v1";
+const DEX_TREND_BOOSTS_LATEST = "https://api.dexscreener.com/token-boosts/latest/v1";
+const DEX_TREND_PROFILES_LATEST = "https://api.dexscreener.com/token-profiles/latest/v1";
+
+const TREND_MAX_WATCH = Number(process.env.TREND_MAX_WATCH || 100);
+const TREND_WINDOW_MIN = Number(process.env.TREND_WINDOW_MIN || 15);
+const TREND_PCT_THRESHOLD = Number(process.env.TREND_PCT_THRESHOLD || 25);
+
+const TREND_MIN_LIQ_USD = Number(process.env.TREND_MIN_LIQ_USD || 5000);
+const TREND_MIN_VOL_24H_USD = Number(process.env.TREND_MIN_VOL_24H_USD || 5000);
+const TREND_MIN_TXNS_1H = Number(process.env.TREND_MIN_TXNS_1H || 25);
+
+const TREND_ALERT_COOLDOWN_MIN = Number(process.env.TREND_ALERT_COOLDOWN_MIN || 45);
+const TREND_HISTORY_MAX = Number(process.env.TREND_HISTORY_MAX || 120);
+
+function ensureWatchState(st) {
+  if (!st.watch) st.watch = {}; // tokenAddr -> { addedAt, lastTrendAlertAt, history: [], reason }
+  return st.watch;
+}
+
+function pruneWatch(st) {
+  const watch = ensureWatchState(st);
+  const cutoff = Date.now() - WATCH_DAYS * 24 * 60 * 60 * 1000;
+  let pruned = 0;
+
+  for (const [addr, item] of Object.entries(watch)) {
+    const addedAt = Number(item?.addedAt || 0);
+    if (!addedAt || addedAt < cutoff) {
+      delete watch[addr];
+      pruned++;
+    }
+  }
+  if (pruned) console.log(`  🧹 Trending: pruned ${pruned} old watch tokens (>${WATCH_DAYS}d)`);
+}
+
+function addToWatch(st, tokenAddr, reason = "dex-trending") {
+  if (!tokenAddr) return;
+  const watch = ensureWatchState(st);
+  if (!watch[tokenAddr]) {
+    watch[tokenAddr] = { addedAt: Date.now(), lastTrendAlertAt: 0, history: [], reason };
+  }
+}
+
+function normalizeTokenAddr(item) {
+  return (
+    item?.tokenAddress ||
+    item?.address ||
+    item?.baseToken?.address ||
+    item?.token?.address ||
+    item?.token?.tokenAddress ||
+    null
+  );
+}
+
+function isSolanaItem(item) {
+  const chain =
+    item?.chainId ||
+    item?.chain ||
+    item?.network ||
+    item?.token?.chainId ||
+    item?.token?.chain ||
+    null;
+
+  // Many feeds omit chain; treat missing as "ok"
+  return !chain || String(chain).toLowerCase() === "solana";
+}
+
+async function fetchTrendingCandidates() {
+  const out = new Set();
+
+  const feeds = [
+    { url: DEX_TREND_BOOSTS_TOP, label: "boosts/top" },
+    { url: DEX_TREND_BOOSTS_LATEST, label: "boosts/latest" },
+    { url: DEX_TREND_PROFILES_LATEST, label: "profiles/latest" },
+  ];
+
+  for (const f of feeds) {
+    try {
+      const res = await fetch(f.url);
+      if (!res.ok) {
+        console.log(`  ⚠️ Trending feed ${f.label}: HTTP ${res.status}`);
+        continue;
+      }
+      const data = await res.json();
+
+      const items = Array.isArray(data) ? data : (Array.isArray(data?.data) ? data.data : []);
+      for (const it of items) {
+        if (!isSolanaItem(it)) continue;
+        const addr = normalizeTokenAddr(it);
+        if (addr) out.add(addr);
+      }
+    } catch (e) {
+      console.log(`  ⚠️ Trending feed error (${f.label}): ${e.message}`);
+    }
+    await sleep(150);
+  }
+
+  return Array.from(out).slice(0, 120);
+}
+
+function baseCap(token) {
+  const mc = Number(token?.marketCap || 0);
+  const fdv = Number(token?.fdv || 0);
+  return mc > 0 ? mc : fdv > 0 ? fdv : 0;
+}
+
+function pctUp(from, to) {
+  if (!from || from <= 0) return 0;
+  return ((to - from) / from) * 100;
+}
+
+function txns1h(token) {
+  const h1 = token?.txns?.h1 || {};
+  const buys = Number(h1.buys || 0);
+  const sells = Number(h1.sells || 0);
+  return { buys, sells, total: buys + sells };
+}
+
+function findBaseline(history, targetTs) {
+  // history is sorted ascending by ts
+  let baseline = null;
+  for (let i = 0; i < history.length; i++) {
+    if (history[i]?.ts <= targetTs) baseline = history[i];
+    else break;
+  }
+  return baseline;
+}
+
+function shouldTrendAlert(watchItem, token) {
+  const now = Date.now();
+  const cooldownMs = TREND_ALERT_COOLDOWN_MIN * 60 * 1000;
+  if (watchItem.lastTrendAlertAt && (now - watchItem.lastTrendAlertAt) < cooldownMs) return null;
+
+  const capNow = baseCap(token);
+  if (!capNow) return null;
+
+  const liq = Number(token?.liquidity || 0);
+  const vol24 = Number(token?.volume24h || 0);
+  const { total: t1h } = txns1h(token);
+
+  if (liq < TREND_MIN_LIQ_USD) return null;
+  if (vol24 < TREND_MIN_VOL_24H_USD) return null;
+  if (t1h < TREND_MIN_TXNS_1H) return null;
+
+  const windowMs = TREND_WINDOW_MIN * 60 * 1000;
+  const hist = Array.isArray(watchItem.history) ? watchItem.history : [];
+  if (hist.length < 2) return null;
+
+  const baseline = findBaseline(hist, now - windowMs);
+  if (!baseline?.cap) return null;
+
+  const pct = pctUp(Number(baseline.cap), capNow);
+  if (pct < TREND_PCT_THRESHOLD) return null;
+
+  return { pct, capThen: Number(baseline.cap), capNow, liq, vol24, t1h };
+}
+
+async function runTrendingTick() {
+  if (!ALERT_RUNNERS) {
+    console.log('📈 Trending tick skipped (ALERT_RUNNERS=0)');
+    return;
+  }
+  if (!TRENDING_ENABLED) return;
+
+  console.log("📈 Trending tick...");
+
+  const st = loadState();
+  pruneSeen(st, SEEN_TTL_DAYS);
+  pruneWatch(st);
+
+  // 1) Discover trending candidates
+  const addrs = await fetchTrendingCandidates();
+  console.log(`  Trending discovery: ${addrs.length} candidates`);
+  for (const a of addrs) addToWatch(st, a, "dex-trending");
+
+  // 2) Monitor watchlist
+  const watch = ensureWatchState(st);
+  const list = Object.keys(watch).slice(0, TREND_MAX_WATCH);
+  console.log(`  Trending watchlist: ${list.length} tokens`);
+
+  let checked = 0;
+  let alerted = 0;
+
+  for (const addr of list) {
+    const item = watch[addr];
+
+    const token = await getTokenDetails(addr);
+    await sleep(220);
+    checked++;
+
+    if (!token) continue;
+
+    const cap = baseCap(token);
+    const snap = {
+      ts: Date.now(),
+      cap,
+      liq: Number(token.liquidity || 0),
+      vol24: Number(token.volume24h || 0),
+      ch1: Number(token.priceChange1h || 0),
+      price: Number(token.price || 0),
+    };
+
+    if (!Array.isArray(item.history)) item.history = [];
+    item.history.push(snap);
+    item.history.sort((a, b) => a.ts - b.ts);
+    if (item.history.length > TREND_HISTORY_MAX) item.history = item.history.slice(-TREND_HISTORY_MAX);
+
+    const verdict = shouldTrendAlert(item, token);
+    if (!verdict) continue;
+
+    item.lastTrendAlertAt = Date.now();
+    alerted++;
+
+    const { buys, sells, total } = txns1h(token);
+    const capLabel = (Number(token.marketCap || 0) > 0) ? "MCap" : "FDV";
+
+    const fields = [
+      { name: "📈 Trend", value: `**+${verdict.pct.toFixed(1)}%** / ${TREND_WINDOW_MIN}m`, inline: true },
+      { name: `🏷️ ${capLabel}`, value: formatCurrency(verdict.capNow), inline: true },
+      { name: "💧 Liquidity", value: formatCurrency(verdict.liq), inline: true },
+      { name: "📊 Vol 24h", value: formatCurrency(verdict.vol24), inline: true },
+      { name: "🔄 Txns (1h)", value: `${total} (B:${buys}/S:${sells})`, inline: true },
+      { name: "📈 1h %", value: `${token.priceChange1h >= 0 ? "+" : ""}${token.priceChange1h.toFixed(2)}%`, inline: true },
+      { name: "Token", value: `\`${token.address}\``, inline: false },
+    ];
+    if (token.url) fields.push({ name: "📊 Chart", value: token.url, inline: false });
+
+    await postToDiscord({
+      title: "📈 RUNNER ALERT (MCap/FDV Acceleration)",
+      description: `**${token.symbol}** — ${token.name}\nAccelerating ${capLabel} over last ${TREND_WINDOW_MIN} minutes.`,
+      fields,
+      color: 0x00b7ff,
+      webhookUrl: DISCORD_WEBHOOK_URL_RUNNERS,
+    });
+
+    console.log(`  ✅ Trending alert sent: ${token.symbol} (+${verdict.pct.toFixed(1)}%/${TREND_WINDOW_MIN}m)`);
+    await sleep(350);
+  }
+
+  saveState(st);
+  console.log(`  Trending done: checked ${checked}, alerted ${alerted}`);
+}
+
+// ---------- Early Move + Confirmed Pump (solves "late alerts") ----------
+const EARLY_MOVE_ENABLED = process.env.EARLY_MOVE_ENABLED !== "0";
+const EARLY_MOVE_5M_PCT = Number(process.env.EARLY_MOVE_5M_PCT || 2);
+const EARLY_MOVE_1H_PCT = Number(process.env.EARLY_MOVE_1H_PCT || 5);
+const EARLY_MOVE_MIN_LIQ = Number(process.env.EARLY_MOVE_MIN_LIQ || 1000);
+const EARLY_MOVE_MIN_TXNS_1H = Number(process.env.EARLY_MOVE_MIN_TXNS_1H || 20);
+const EARLY_MOVE_MIN_VOL_24H = Number(process.env.EARLY_MOVE_MIN_VOL_24H || 2500);
+const EARLY_ALERT_COOLDOWN_MIN = Number(process.env.EARLY_ALERT_COOLDOWN_MIN || 30);
+
+const PUMP_ENABLED = process.env.PUMP_ENABLED !== "0";
+const CONF_PUMP_5M_PCT = Number(process.env.CONF_PUMP_5M_PCT || 6);
+const CONF_PUMP_1H_PCT = Number(process.env.CONF_PUMP_1H_PCT || 20);
+const CONF_PUMP_MIN_LIQ = Number(process.env.CONF_PUMP_MIN_LIQ || 10000);
+const CONF_PUMP_MIN_TXNS_1H = Number(process.env.CONF_PUMP_MIN_TXNS_1H || 40);
+const CONF_PUMP_MIN_VOL_24H = Number(process.env.CONF_PUMP_MIN_VOL_24H || 10000);
+const CONF_PUMP_ALERT_COOLDOWN_MIN = Number(process.env.CONF_PUMP_ALERT_COOLDOWN_MIN || 45);
+
+function ensurePumpState(st) {
+  if (!st.pumps) st.pumps = {}; // token -> { lastEarlyAt, lastPumpAt }
+  return st.pumps;
+}
+
+function pumpCooldownOk(lastAt, min) {
+  if (!lastAt) return true;
+  return (Date.now() - lastAt) > (min * 60 * 1000);
+}
+
+function meetsEarlyMove(token) {
+  const liq = Number(token.liquidity || 0);
+  const vol24 = Number(token.volume24h || 0);
+  const ch5 = Number(token.priceChange5m || 0);
+  const ch1 = Number(token.priceChange1h || 0);
+  const { total: t1h } = txns1h(token);
+
+  if (liq < EARLY_MOVE_MIN_LIQ) return false;
+  if (vol24 < EARLY_MOVE_MIN_VOL_24H) return false;
+  if (t1h < EARLY_MOVE_MIN_TXNS_1H) return false;
+
+  return (ch5 >= EARLY_MOVE_5M_PCT) || (ch1 >= EARLY_MOVE_1H_PCT);
+}
+
+function meetsConfirmedPump(token) {
+  const liq = Number(token.liquidity || 0);
+  const vol24 = Number(token.volume24h || 0);
+  const ch5 = Number(token.priceChange5m || 0);
+  const ch1 = Number(token.priceChange1h || 0);
+  const { total: t1h } = txns1h(token);
+
+  if (liq < CONF_PUMP_MIN_LIQ) return false;
+  if (vol24 < CONF_PUMP_MIN_VOL_24H) return false;
+  if (t1h < CONF_PUMP_MIN_TXNS_1H) return false;
+
+  return (ch5 >= CONF_PUMP_5M_PCT) && (ch1 >= CONF_PUMP_1H_PCT);
+}
+
+async function runPumpMonitorsTick(st) {
+  if (!EARLY_MOVE_ENABLED && !PUMP_ENABLED) return;
+
+  const watch = ensureWatchState(st);
+  const pumps = ensurePumpState(st);
+
+  const list = Object.keys(watch).slice(0, Math.max(TREND_MAX_WATCH, 100));
+  console.log(`📟 Pump monitor: ${list.length} tokens`);
+
+  let earlySent = 0;
+  let pumpSent = 0;
+
+  for (const addr of list) {
+    const token = await getTokenDetails(addr);
+    await sleep(200);
+    if (!token) continue;
+
+    if (!pumps[addr]) pumps[addr] = { lastEarlyAt: 0, lastPumpAt: 0 };
+
+    if (EARLY_MOVE_ENABLED && pumpCooldownOk(pumps[addr].lastEarlyAt, EARLY_ALERT_COOLDOWN_MIN) && meetsEarlyMove(token)) {
+      pumps[addr].lastEarlyAt = Date.now();
+      earlySent++;
+
+      const { buys, sells, total } = txns1h(token);
+      const fields = [
+        { name: "⏰ Age", value: formatAge(token.pairCreatedAt), inline: true },
+        { name: "📈 5m", value: `${token.priceChange5m >= 0 ? "+" : ""}${Number(token.priceChange5m).toFixed(2)}%`, inline: true },
+        { name: "📈 1h", value: `${token.priceChange1h >= 0 ? "+" : ""}${Number(token.priceChange1h).toFixed(2)}%`, inline: true },
+        { name: "💧 Liq", value: formatCurrency(token.liquidity), inline: true },
+        { name: "📊 Vol 24h", value: formatCurrency(token.volume24h), inline: true },
+        { name: "🔄 Txns (1h)", value: `${total} (B:${buys}/S:${sells})`, inline: true },
+        { name: "Token", value: `\`${token.address}\``, inline: false },
+      ];
+      if (token.url) fields.push({ name: "📊 Chart", value: token.url, inline: false });
+
+      await postToDiscord({
+        title: "🚨 EARLY MOVE ALERT",
+        description: `**${token.symbol}** — ${token.name}\nEarly momentum detected (baseline-free).`,
+        fields,
+        color: 0xf1c40f,
+        webhookUrl: DISCORD_WEBHOOK_URL_RUNNERS,
+      });
+
+      console.log(`  🚨 Early move alert: ${token.symbol}`);
+      await sleep(250);
+    }
+
+    if (PUMP_ENABLED && pumpCooldownOk(pumps[addr].lastPumpAt, CONF_PUMP_ALERT_COOLDOWN_MIN) && meetsConfirmedPump(token)) {
+      pumps[addr].lastPumpAt = Date.now();
+      pumpSent++;
+
+      const { buys, sells, total } = txns1h(token);
+      const fields = [
+        { name: "⏰ Age", value: formatAge(token.pairCreatedAt), inline: true },
+        { name: "📈 5m", value: `${token.priceChange5m >= 0 ? "+" : ""}${Number(token.priceChange5m).toFixed(2)}%`, inline: true },
+        { name: "📈 1h", value: `${token.priceChange1h >= 0 ? "+" : ""}${Number(token.priceChange1h).toFixed(2)}%`, inline: true },
+        { name: "💧 Liq", value: formatCurrency(token.liquidity), inline: true },
+        { name: "📊 Vol 24h", value: formatCurrency(token.volume24h), inline: true },
+        { name: "🔄 Txns (1h)", value: `${total} (B:${buys}/S:${sells})`, inline: true },
+        { name: "Token", value: `\`${token.address}\``, inline: false },
+      ];
+      if (token.url) fields.push({ name: "📊 Chart", value: token.url, inline: false });
+
+      await postToDiscord({
+        title: "📈 PUMP ALERT!",
+        description: `**${token.symbol}** — ${token.name}\nConfirmed pump conditions met.`,
+        fields,
+        color: 0xe74c3c,
+        webhookUrl: DISCORD_WEBHOOK_URL_RUNNERS,
+      });
+
+      console.log(`  📈 Pump alert: ${token.symbol}`);
+      await sleep(250);
+    }
+  }
+
+  console.log(`📟 Pump monitor done: early=${earlySent}, pump=${pumpSent}`);
+}
+
 (async () => {
   if (process.env.SEED_ONLY === "1") {
     const st = loadState();
@@ -514,9 +1047,27 @@ async function scanForGems() {
     process.exit(0);
   }
   console.log("💎🚀 RAYDIUM MEME HUNTER 🚀💎");
+  console.log("Runtime config:", { POLL_MS, MAX_ANALYZE, ALERT_TOP_N, MIN_LIQ_USD, MIN_VOL_24H_USD, MIN_AGE_MINUTES, MAX_AGE_HOURS, ENABLE_RUG_FILTERS, TOPHOLDERS_MAX_PCT, ALERT_LAUNCH_GEMS, ALERT_RUNNERS });
   console.log("=".repeat(60));
   console.log(`Poll: ${POLL_MS / 1000}s | Window: ${MIN_AGE_MINUTES}m-${MAX_AGE_HOURS}h | Watch: ${WATCH_DAYS}d`);
   console.log("=".repeat(60));
-  await scanForGems().catch(e => console.error("Error:", e));
-  setInterval(() => scanForGems().catch(e => console.error("Error:", e)), POLL_MS);
+  const tick = async () => {
+    // 1) Gems discovery (new pools / candidates)
+    await scanForGems().catch(e => console.error("Gems error:", e));
+
+    // 2) Trending discovery + cap/FDV acceleration (older coins included)
+    await runTrendingTick().catch(e => console.error("Trending error:", e));
+
+    // 3) Baseline-free early move + confirmed pump alerts over the watchlist
+    const st = loadState();
+    const watchSize = Object.keys(st.watch || {}).length;
+    const seenSize = Object.keys(st.seenTokens || {}).length;
+    await runPumpMonitorsTick(st).catch(e => console.error("Pump error:", e));
+    saveState(st);
+
+    // 4) Heartbeat (confirms uptime + helps debug "missed" moves)
+    await maybeHeartbeat({ watchSize, seenSize }).catch(() => {});
+  };
+  await tick();
+  setInterval(() => tick().catch(e => console.error("Tick error:", e)), POLL_MS);
 })();
