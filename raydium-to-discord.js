@@ -35,23 +35,13 @@ const MIN_AGE_MINUTES = Number(process.env.MIN_AGE_MINUTES || 2);
 const WATCH_DAYS = Number(process.env.WATCH_DAYS || 3); // watch coins for 3 days
 const WATCH_HOURS = WATCH_DAYS * 24;
 const PUMP_CHECK_LIMIT = Number(process.env.PUMP_CHECK_LIMIT || 100);
-const MIN_PUMP_AGE_MINUTES = Number(process.env.MIN_PUMP_AGE_MINUTES || 3);
-// Pump tier thresholds
-const MIN_PUMP_EARLY_LIQ_USD = Number(process.env.MIN_PUMP_EARLY_LIQ_USD || 3000);
-const MIN_PUMP_EARLY_M5_TXNS = Number(process.env.MIN_PUMP_EARLY_M5_TXNS || 20);
-const MIN_PUMP_EARLY_M5_BUYS = Number(process.env.MIN_PUMP_EARLY_M5_BUYS || 10);
-const MIN_PUMP_EARLY_M5_VOL_USD = Number(process.env.MIN_PUMP_EARLY_M5_VOL_USD || 1000);
-const MIN_PUMP_CONF_LIQ_USD = Number(process.env.MIN_PUMP_CONF_LIQ_USD || 10000);
-const MIN_PUMP_CONF_M5_TXNS = Number(process.env.MIN_PUMP_CONF_M5_TXNS || 35);
-const MIN_PUMP_CONF_M5_BUYS = Number(process.env.MIN_PUMP_CONF_M5_BUYS || 18);
-const MIN_PUMP_CONF_M5_VOL_USD = Number(process.env.MIN_PUMP_CONF_M5_VOL_USD || 2500);
 const MIN_LIQ_USD = Number(process.env.MIN_LIQ_USD || 1200);
 const MIN_VOL_24H_USD = Number(process.env.MIN_VOL_24H_USD || 500);
 const MAX_MARKETCAP_USD = Number(process.env.MAX_MARKETCAP_USD || 10_000_000);
 const SEEN_TTL_DAYS = Number(process.env.SEEN_TTL_DAYS || 14);
 const NEW_ALERT_COOLDOWN_HOURS = Number(process.env.NEW_ALERT_COOLDOWN_HOURS || 12);
 const PUMP_ALERT_COOLDOWN_HOURS = Number(process.env.PUMP_ALERT_COOLDOWN_HOURS || 6);
-const PUMP_5M_PCT = Number(process.env.PUMP_5M_PCT || 8);
+const PUMP_5M_PCT = Number(process.env.PUMP_5M_PCT || 6);
 const PUMP_VOL_MULT = Number(process.env.PUMP_VOL_MULT || 2.5);
 const PUMP_BUYSELL_RATIO = Number(process.env.PUMP_BUYSELL_RATIO || 1.8);
 const PUMP_MIN_H1_TXNS = Number(process.env.PUMP_MIN_H1_TXNS || 20);
@@ -137,11 +127,6 @@ function formatPrice(p) {
 function getH1Txns(token) {
   const h1 = token.txns?.h1 || {};
   return { buys: Number(h1.buys || 0), sells: Number(h1.sells || 0), total: Number(h1.buys || 0) + Number(h1.sells || 0) };
-}
-
-function getM5Txns(token) {
-  const m5 = token.txns?.m5 || {};
-  return { buys: Number(m5.buys || 0), sells: Number(m5.sells || 0), total: Number(m5.buys || 0) + Number(m5.sells || 0) };
 }
 
 function hoursAgo(ms) {
@@ -327,8 +312,6 @@ async function getTokenDetails(tokenAddress, preferredPairAddress = null) {
       priceChange5m: Number(pair?.priceChange?.m5 || 0),
       priceChange1h: Number(pair?.priceChange?.h1 || 0),
       priceChange24h: Number(pair?.priceChange?.h24 || 0),
-      volumeM5: Number(pair?.volume?.m5 || 0),
-      volumeH1: Number(pair?.volume?.h1 || 0),
       volume24h: Number(pair?.volume?.h24 || 0),
       liquidity: Number(pair?.liquidity?.usd || 0),
       marketCap: Number(pair?.marketCap || 0),
@@ -426,6 +409,7 @@ async function scanSeenForPumps(state) {
     if (!meta) continue;
     const refTime = meta.pairCreatedAt || meta.firstSeenAt;
     if (getAgeHours(refTime) > WATCH_HOURS) continue;
+    if (!canSendCooldown(meta.lastPumpAlertAt, PUMP_ALERT_COOLDOWN_HOURS)) continue;
     const token = await getTokenDetails(addr, meta.pairAddress || null);
     await sleep(150);
     if (!token) continue;
@@ -435,71 +419,25 @@ async function scanSeenForPumps(state) {
     meta.lastKnown = { priceChange5m: token.priceChange5m, priceChange1h: token.priceChange1h, volume24h: token.volume24h, liquidity: token.liquidity };
     if (!meta.baseline) meta.baseline = { price: token.price, volume24h: token.volume24h, liquidity: token.liquidity };
     if (shouldTriggerPumpAlert(token, meta.baseline)) {
-      // Hard age floor to avoid dust spikes
-      if (getAgeMinutes(token.pairCreatedAt) < MIN_PUMP_AGE_MINUTES) {
-        // too fresh
-      } else {
-        const m5 = getM5Txns(token);
-        const h1 = getH1Txns(token);
-        const m5Vol = Number(token.volumeM5 || 0);
-
-        // Tier checks (confirmed first)
-        const isConfirmed =
-          (token.liquidity || 0) >= MIN_PUMP_CONF_LIQ_USD &&
-          m5.total >= MIN_PUMP_CONF_M5_TXNS &&
-          m5.buys >= MIN_PUMP_CONF_M5_BUYS &&
-          m5Vol >= MIN_PUMP_CONF_M5_VOL_USD;
-
-        const isEarly =
-          (token.liquidity || 0) >= MIN_PUMP_EARLY_LIQ_USD &&
-          m5.total >= MIN_PUMP_EARLY_M5_TXNS &&
-          m5.buys >= MIN_PUMP_EARLY_M5_BUYS &&
-          m5Vol >= MIN_PUMP_EARLY_M5_VOL_USD;
-
-        if (isConfirmed && canSendCooldown(meta.lastPumpAlertConfirmedAt, PUMP_ALERT_COOLDOWN_HOURS)) {
-          meta.lastPumpAlertConfirmedAt = Date.now();
-          await postToDiscord({
-            title: "✅ CONFIRMED PUMP",
-            description: `**${token.symbol}** — ${token.name}`,
-            color: 0x00ff00,
-            webhookUrl: DISCORD_WEBHOOK_URL_PUMP_CONFIRMED,
-            fields: [
-              { name: "⏰ Age", value: formatAge(token.pairCreatedAt), inline: true },
-              { name: "📈 5m", value: `${token.priceChange5m >= 0 ? '+' : ''}${token.priceChange5m.toFixed(2)}%`, inline: true },
-              { name: "📈 1h", value: `${token.priceChange1h >= 0 ? '+' : ''}${token.priceChange1h.toFixed(2)}%`, inline: true },
-              { name: "💧 Liq", value: formatCurrency(token.liquidity), inline: true },
-              { name: "💸 Vol (5m)", value: formatCurrency(m5Vol), inline: true },
-              { name: "🔄 Txns (5m)", value: `${m5.total} (${m5.buys}/${m5.sells})`, inline: true },
-              { name: "🔄 Txns (1h)", value: `${h1.total} (${h1.buys}/${h1.sells})`, inline: true },
-              { name: "📊 Vol 24h", value: formatCurrency(token.volume24h), inline: true },
-              { name: "Token", value: `\`${token.address}\``, inline: false },
-              ...(token.url ? [{ name: "Chart", value: token.url, inline: false }] : []),
-            ],
-          });
-          console.log(`🚨 Confirmed pump: ${token.symbol}`);
-        } else if (isEarly && canSendCooldown(meta.lastPumpAlertEarlyAt, PUMP_ALERT_COOLDOWN_HOURS)) {
-          meta.lastPumpAlertEarlyAt = Date.now();
-          await postToDiscord({
-            title: "🚀 EARLY PUMP",
-            description: `**${token.symbol}** — ${token.name}`,
-            color: 0xffa500,
-            webhookUrl: DISCORD_WEBHOOK_URL_PUMP_EARLY,
-            fields: [
-              { name: "⏰ Age", value: formatAge(token.pairCreatedAt), inline: true },
-              { name: "📈 5m", value: `${token.priceChange5m >= 0 ? '+' : ''}${token.priceChange5m.toFixed(2)}%`, inline: true },
-              { name: "📈 1h", value: `${token.priceChange1h >= 0 ? '+' : ''}${token.priceChange1h.toFixed(2)}%`, inline: true },
-              { name: "💧 Liq", value: formatCurrency(token.liquidity), inline: true },
-              { name: "💸 Vol (5m)", value: formatCurrency(m5Vol), inline: true },
-              { name: "🔄 Txns (5m)", value: `${m5.total} (${m5.buys}/${m5.sells})`, inline: true },
-              { name: "🔄 Txns (1h)", value: `${h1.total} (${h1.buys}/${h1.sells})`, inline: true },
-              { name: "📊 Vol 24h", value: formatCurrency(token.volume24h), inline: true },
-              { name: "Token", value: `\`${token.address}\``, inline: false },
-              ...(token.url ? [{ name: "Chart", value: token.url, inline: false }] : []),
-            ],
-          });
-          console.log(`🚨 Early pump: ${token.symbol}`);
-        }
-      }
+      meta.lastPumpAlertAt = Date.now();
+      const { buys, sells, total } = getH1Txns(token);
+      const ratio = sells > 0 ? (buys / sells).toFixed(2) : "∞";
+      await postToDiscord({
+        title: "📈 PUMP ALERT!",
+        description: `**${token.symbol}** — ${token.name}`,
+        color: 0xff0000,
+        fields: [
+          { name: "⏰ Age", value: formatAge(token.pairCreatedAt), inline: true },
+          { name: "📈 5m", value: `${token.priceChange5m >= 0 ? '+' : ''}${token.priceChange5m.toFixed(2)}%`, inline: true },
+          { name: "📈 1h", value: `${token.priceChange1h >= 0 ? '+' : ''}${token.priceChange1h.toFixed(2)}%`, inline: true },
+          { name: "💧 Liq", value: formatCurrency(token.liquidity), inline: true },
+          { name: "📊 Vol", value: formatCurrency(token.volume24h), inline: true },
+          { name: "🔄 B/S", value: `${total} (${buys}/${sells}) R:${ratio}`, inline: true },
+          { name: "Token", value: `\`${token.address}\``, inline: false },
+          ...(token.url ? [{ name: "Chart", value: token.url, inline: false }] : []),
+        ],
+      });
+      console.log(`🚨 Pump: ${token.symbol}`);
     }
     state.seenTokens[addr] = meta;
   }
@@ -863,7 +801,6 @@ const EARLY_MOVE_MIN_VOL_24H = Number(process.env.EARLY_MOVE_MIN_VOL_24H || 2500
 const EARLY_ALERT_COOLDOWN_MIN = Number(process.env.EARLY_ALERT_COOLDOWN_MIN || 30);
 
 const PUMP_ENABLED = process.env.PUMP_ENABLED !== "0";
-const PUMP_5M_PCT = Number(process.env.PUMP_5M_PCT || 6);
 const PUMP_1H_PCT = Number(process.env.PUMP_1H_PCT || 20);
 const PUMP_MIN_LIQ = Number(process.env.PUMP_MIN_LIQ || 10000);
 const PUMP_MIN_TXNS_1H = Number(process.env.PUMP_MIN_TXNS_1H || 40);
