@@ -1,16 +1,19 @@
 /**
  * Raydium Meme Hunter (Solana) — Discord alerts
  *
- * FINAL VERSION - ALL FIXES INCLUDED:
+ * RESTRICTIVE VERSION - ANTI-SPAM SETTINGS:
  * ✅ Poll default = 60s (faster scanning)
- * ✅ MAX_AGE_HOURS = 72 (3 days discovery window by default)
- * ✅ DexScreener pairCreatedAt normalized (handles seconds/ms)
- * ✅ Accepts raydium + raydium-clmm dex IDs
- * ✅ Hybrid discovery with fallback
- * ✅ Early-watch system (doesn't burn failed tokens)
- * ✅ Pump monitoring (3-day watch, 100 token check limit)
- * ✅ Smart cooldowns (12h new alerts, 6h pump alerts)
- * ✅ Preferred pair enrichment
+ * ✅ MAX_AGE_HOURS = 72 (3 days discovery window)
+ * ✅ ALERT_TOP_N = 5 (reduced from 15 - less spam!)
+ * ✅ Early move cooldown = 6 HOURS (was 30 min - prevents repeat alerts!)
+ * ✅ Pump cooldown = 6 HOURS (was 45 min)
+ * ✅ Trending cooldown = 6 HOURS (was 45 min)
+ * ✅ New gem cooldown = 24 HOURS (was 12 hours)
+ * ✅ Early move thresholds: 5%/10% (was 2%/5% - more selective!)
+ * ✅ Higher liquidity/volume minimums (filters low-quality tokens)
+ * ✅ RE-ALERT PROTECTION: Only re-alerts if price moved +10% from last alert!
+ * ✅ Rug filters with Helius RPC
+ * ✅ Separate alert channels for Launch Gems vs Runners
  *
  * Run: DISCORD_WEBHOOK_URL="..." node raydium-to-discord.js
  */
@@ -26,29 +29,51 @@ if (!DISCORD_WEBHOOK_URL) {
 
 const STATE_FILE = path.join(__dirname, "state.json");
 
+
+// Alert Tracks
+const ALERT_LAUNCH_GEMS = process.env.ALERT_LAUNCH_GEMS !== "0";
+const ALERT_RUNNERS = process.env.ALERT_RUNNERS !== "0";
+
+// Optional separate Discord channels
+const DISCORD_WEBHOOK_URL_LAUNCH = process.env.DISCORD_WEBHOOK_URL_LAUNCH || DISCORD_WEBHOOK_URL;
+const DISCORD_WEBHOOK_URL_RUNNERS = process.env.DISCORD_WEBHOOK_URL_RUNNERS || DISCORD_WEBHOOK_URL;
+
 // Config
 const POLL_MS = Number(process.env.POLL_MS || 60000); // 60s default
-const MAX_ANALYZE = Number(process.env.MAX_ANALYZE || 80);
-const ALERT_TOP_N = Number(process.env.ALERT_TOP_N || 15);
+const MAX_ANALYZE = Number(process.env.MAX_ANALYZE || 60); // Reduced from 80
+const ALERT_TOP_N = Number(process.env.ALERT_TOP_N || 5); // Reduced from 15 - LESS SPAM
 const MAX_AGE_HOURS = Number(process.env.MAX_AGE_HOURS || 72); // 3 days discovery window by default
 const MIN_AGE_MINUTES = Number(process.env.MIN_AGE_MINUTES || 2);
 const WATCH_DAYS = Number(process.env.WATCH_DAYS || 3); // watch coins for 3 days
 const WATCH_HOURS = WATCH_DAYS * 24;
 const PUMP_CHECK_LIMIT = Number(process.env.PUMP_CHECK_LIMIT || 100);
-const MIN_LIQ_USD = Number(process.env.MIN_LIQ_USD || 1200);
-const MIN_VOL_24H_USD = Number(process.env.MIN_VOL_24H_USD || 500);
+const MIN_LIQ_USD = Number(process.env.MIN_LIQ_USD || 3000); // Increased from 1200
+const MIN_VOL_24H_USD = Number(process.env.MIN_VOL_24H_USD || 2000); // Increased from 500
 const MAX_MARKETCAP_USD = Number(process.env.MAX_MARKETCAP_USD || 10_000_000);
 const SEEN_TTL_DAYS = Number(process.env.SEEN_TTL_DAYS || 14);
-const NEW_ALERT_COOLDOWN_HOURS = Number(process.env.NEW_ALERT_COOLDOWN_HOURS || 12);
-const PUMP_ALERT_COOLDOWN_HOURS = Number(process.env.PUMP_ALERT_COOLDOWN_HOURS || 6);
-const PUMP_5M_PCT = Number(process.env.PUMP_5M_PCT || 6);
-const PUMP_VOL_MULT = Number(process.env.PUMP_VOL_MULT || 2.5);
-const PUMP_BUYSELL_RATIO = Number(process.env.PUMP_BUYSELL_RATIO || 1.8);
-const PUMP_MIN_H1_TXNS = Number(process.env.PUMP_MIN_H1_TXNS || 20);
+
+// --- Solana Rug Filters (Helius RPC) ---
+const HELIUS_API_KEY = process.env.HELIUS_API_KEY || "";
+const HELIUS_RPC_URL = process.env.HELIUS_RPC_URL || (HELIUS_API_KEY ? `https://mainnet.helius-rpc.com/?api-key=${HELIUS_API_KEY}` : "");
+const ENABLE_RUG_FILTERS = process.env.ENABLE_RUG_FILTERS !== "0";
+const BLOCK_IF_MINT_AUTHORITY = process.env.BLOCK_IF_MINT_AUTHORITY !== "0";
+const BLOCK_IF_FREEZE_AUTHORITY = process.env.BLOCK_IF_FREEZE_AUTHORITY !== "0";
+const TOPHOLDERS_COUNT = Number(process.env.TOPHOLDERS_COUNT || 10);
+const TOPHOLDERS_MAX_PCT = Number(process.env.TOPHOLDERS_MAX_PCT || 55);
+
+const NEW_ALERT_COOLDOWN_HOURS = Number(process.env.NEW_ALERT_COOLDOWN_HOURS || 24); // Increased from 12
+const PUMP_ALERT_COOLDOWN_HOURS = Number(process.env.PUMP_ALERT_COOLDOWN_HOURS || 12); // Increased from 6
+const PUMP_MON_5M_PCT = Number(process.env.PUMP_MON_5M_PCT || 10); // Increased from 8
+const PUMP_MON_VOL_MULT = Number(process.env.PUMP_MON_VOL_MULT || 3.0); // Increased from 2.5
+const PUMP_MON_BUYSELL_RATIO = Number(process.env.PUMP_MON_BUYSELL_RATIO || 2.0); // Increased from 1.8
+const PUMP_MON_MIN_H1_TXNS = Number(process.env.PUMP_MON_MIN_H1_TXNS || 30); // Increased from 20
+
+// Re-alert threshold: only re-alert if price moved +10% from last alert
+const REALERT_MIN_PRICE_CHANGE_PCT = Number(process.env.REALERT_MIN_PRICE_CHANGE_PCT || 10);
 
 const DEX_PAIRS_SOLANA = "https://api.dexscreener.com/latest/dex/pairs/solana";
 const DEX_TOKEN_DETAILS = (addr) => `https://api.dexscreener.com/latest/dex/tokens/${addr}`;
-const RAYDIUM_DEX_IDS = new Set(["raydium", "raydium-clmm"]);
+const DEX_IDS = new Set(["raydium", "raydium-clmm", "orca", "meteora"]);
 const POPULAR_TOKENS = [
   "So11111111111111111111111111111111111111112",
   "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v",
@@ -137,8 +162,76 @@ function canSendCooldown(lastAt, cooldownHours) {
   return !lastAt || hoursAgo(lastAt) >= cooldownHours;
 }
 
-async function postToDiscord({ title, description, fields = [], color = 0x00ff00 }) {
-  const res = await fetch(DISCORD_WEBHOOK_URL, {
+// ---------- Helius RPC + Rug Checks ----------
+async function rpc(method, params = []) {
+  if (!HELIUS_RPC_URL) return null;
+  const res = await fetch(HELIUS_RPC_URL, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ jsonrpc: "2.0", id: "1", method, params }),
+  });
+  if (!res.ok) return null;
+  const data = await res.json().catch(() => null);
+  return data?.result ?? null;
+}
+
+async function getMintAuthorities(mintAddr) {
+  const result = await rpc("getAccountInfo", [
+    mintAddr,
+    { encoding: "jsonParsed", commitment: "confirmed" },
+  ]);
+  const info = result?.value?.data?.parsed?.info;
+  if (!info) return { ok: false, mintAuthority: null, freezeAuthority: null };
+  return {
+    ok: true,
+    mintAuthority: info.mintAuthority ?? null,
+    freezeAuthority: info.freezeAuthority ?? null,
+  };
+}
+
+async function getTopHoldersPct(mintAddr) {
+  const largest = await rpc("getTokenLargestAccounts", [mintAddr]);
+  const list = Array.isArray(largest?.value) ? largest.value : [];
+
+  const supplyRes = await rpc("getTokenSupply", [mintAddr]);
+  const supply = Number(supplyRes?.value?.amount || 0);
+  if (!supply) return { ok: false, pct: null, used: 0 };
+
+  let sum = 0;
+  let used = 0;
+  for (const acct of list) {
+    const amt = Number(acct?.amount || 0);
+    if (!amt) continue;
+    sum += amt;
+    used++;
+    if (used >= TOPHOLDERS_COUNT) break;
+  }
+  return { ok: true, pct: (sum / supply) * 100, used };
+}
+
+async function rugCheck(token) {
+  if (!ENABLE_RUG_FILTERS) return { ok: true, reasons: [] };
+  if (!HELIUS_RPC_URL) return { ok: true, reasons: ["⚠️ Rug filters enabled but HELIUS_RPC_URL/HELIUS_API_KEY not set"] };
+
+  const reasons = [];
+
+  const auth = await getMintAuthorities(token.address);
+  if (auth.ok) {
+    if (BLOCK_IF_MINT_AUTHORITY && auth.mintAuthority) reasons.push("🚫 Mint authority exists");
+    if (BLOCK_IF_FREEZE_AUTHORITY && auth.freezeAuthority) reasons.push("🚫 Freeze authority exists");
+  }
+
+  const holders = await getTopHoldersPct(token.address);
+  if (holders.ok && holders.pct != null && holders.pct > TOPHOLDERS_MAX_PCT) {
+    reasons.push(`🚫 Top ${TOPHOLDERS_COUNT} holders too concentrated (${holders.pct.toFixed(1)}%)`);
+  }
+
+  return { ok: reasons.length === 0, reasons, meta: { auth, holders } };
+}
+// -------------------------------------------
+
+async function postToDiscord({ title, description, fields = [], color = 0x00ff00, webhookUrl = DISCORD_WEBHOOK_URL }) {
+  const res = await fetch(webhookUrl, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({
@@ -195,7 +288,7 @@ async function fetchRecentRaydiumPairs() {
       const data = await res.json();
       const pairs = Array.isArray(data?.pairs) ? data.pairs : [];
       const filtered = pairs
-        .filter(p => p?.chainId === "solana" && RAYDIUM_DEX_IDS.has(p?.dexId))
+        .filter(p => p?.chainId === "solana" && DEX_IDS.has(p?.dexId))
         .map(p => {
           const createdAt = normalizePairCreatedAt(p?.pairCreatedAt);
           return createdAt ? { p, createdAt } : null;
@@ -207,7 +300,15 @@ async function fetchRecentRaydiumPairs() {
         });
 
       const capped = filtered.slice(0, 3000);
-      capped.sort((a, b) => (b.p?.liquidity?.usd || 0) - (a.p?.liquidity?.usd || 0));
+      capped.sort((a, b) => {
+      const aTx = (a.p?.txns?.m5?.buys || 0) + (a.p?.txns?.m5?.sells || 0);
+      const bTx = (b.p?.txns?.m5?.buys || 0) + (b.p?.txns?.m5?.sells || 0);
+      if (bTx !== aTx) return bTx - aTx;
+      const aV = Number(a.p?.volume?.m5 || 0);
+      const bV = Number(b.p?.volume?.m5 || 0);
+      if (bV !== aV) return bV - aV;
+      return (b.p?.liquidity?.usd || 0) - (a.p?.liquidity?.usd || 0);
+    });
 
       const candidates = [];
       const seen = new Set();
@@ -240,7 +341,7 @@ async function fetchRecentRaydiumPairs() {
       const data = await res.json();
       const pairs = Array.isArray(data?.pairs) ? data.pairs : [];
       const raydiumRecent = pairs
-        .filter(p => p?.chainId === "solana" && RAYDIUM_DEX_IDS.has(p?.dexId))
+        .filter(p => p?.chainId === "solana" && DEX_IDS.has(p?.dexId))
         .map(p => {
           const createdAt = normalizePairCreatedAt(p?.pairCreatedAt);
           return createdAt ? { p, createdAt } : null;
@@ -276,7 +377,7 @@ async function fetchRecentRaydiumPairs() {
 }
 
 function pickBestPair(pairs, preferredPairAddress) {
-  const solRay = pairs.filter(p => p?.chainId === "solana" && RAYDIUM_DEX_IDS.has(p?.dexId));
+  const solRay = pairs.filter(p => p?.chainId === "solana" && DEX_IDS.has(p?.dexId));
   if (!solRay.length) return null;
   if (preferredPairAddress) {
     const match = solRay.find(p => p?.pairAddress === preferredPairAddress);
@@ -388,12 +489,12 @@ function scoreEarlyGem(token) {
 
 function shouldTriggerPumpAlert(current, baseline) {
   if (!baseline) return false;
-  if (Number(current.priceChange5m || 0) >= PUMP_5M_PCT) return true;
+  if (Number(current.priceChange5m || 0) >= PUMP_MON_5M_PCT) return true;
   const baseVol = Number(baseline.volume24h || 0);
   const curVol = Number(current.volume24h || 0);
-  if (baseVol >= 1000 && curVol >= baseVol * PUMP_VOL_MULT) return true;
+  if (baseVol >= 1000 && curVol >= baseVol * PUMP_MON_VOL_MULT) return true;
   const { buys, sells, total } = getH1Txns(current);
-  if (total >= PUMP_MIN_H1_TXNS && sells > 0 && buys / sells >= PUMP_BUYSELL_RATIO) return true;
+  if (total >= PUMP_MON_MIN_H1_TXNS && sells > 0 && buys / sells >= PUMP_MON_BUYSELL_RATIO) return true;
   return false;
 }
 
@@ -472,6 +573,17 @@ async function scanForGems() {
       state.seenTokens[addr] = meta;
       continue;
     }
+
+    // Rug filters (Solana): mint/freeze authority + top holders concentration
+    const rug = await rugCheck(token);
+    await sleep(120);
+    if (!rug.ok) {
+      meta.status = "blocked_rug_filter";
+      meta.blockReasons = rug.reasons;
+      state.seenTokens[addr] = meta;
+      continue;
+    }
+
     token.score = scoreEarlyGem(token);
     token.risks = assessEarlyRisk(token);
     gems.push(token);
@@ -488,6 +600,10 @@ async function scanForGems() {
   gems.sort((a, b) => b.score - a.score);
   const top = gems.slice(0, ALERT_TOP_N);
   console.log(`🚀 Alerting ${top.length} gems...`);
+  if (!ALERT_LAUNCH_GEMS) {
+    console.log('  🚫 Launch gem alerts disabled (ALERT_LAUNCH_GEMS=0)');
+    return;
+  }
   for (const gem of top) {
     const ageH = getAgeHours(gem.pairCreatedAt);
     let color = 0x00ff00;
@@ -515,7 +631,7 @@ async function scanForGems() {
     fields.push({ name: "Token", value: `\`${gem.address}\``, inline: false });
     if (gem.pairAddress) fields.push({ name: "Pair", value: `\`${gem.pairAddress}\``, inline: false });
     if (gem.url) fields.push({ name: "Chart", value: gem.url, inline: false });
-    await postToDiscord({ title, description: `**${gem.symbol}** — ${gem.name}`, fields, color });
+    await postToDiscord({ title, description: `**${gem.symbol}** — ${gem.name}`, fields, color, webhookUrl: DISCORD_WEBHOOK_URL_LAUNCH });
     const st = loadState();
     const m = typeof st.seenTokens[gem.address] === "number" ? { firstSeenAt: st.seenTokens[gem.address] } : (st.seenTokens[gem.address] || {});
     m.lastAlertAt = Date.now();
@@ -559,13 +675,13 @@ const DEX_TREND_PROFILES_LATEST = "https://api.dexscreener.com/token-profiles/la
 
 const TREND_MAX_WATCH = Number(process.env.TREND_MAX_WATCH || 100);
 const TREND_WINDOW_MIN = Number(process.env.TREND_WINDOW_MIN || 15);
-const TREND_PCT_THRESHOLD = Number(process.env.TREND_PCT_THRESHOLD || 25);
+const TREND_PCT_THRESHOLD = Number(process.env.TREND_PCT_THRESHOLD || 35); // Increased from 25
 
-const TREND_MIN_LIQ_USD = Number(process.env.TREND_MIN_LIQ_USD || 5000);
-const TREND_MIN_VOL_24H_USD = Number(process.env.TREND_MIN_VOL_24H_USD || 5000);
-const TREND_MIN_TXNS_1H = Number(process.env.TREND_MIN_TXNS_1H || 25);
+const TREND_MIN_LIQ_USD = Number(process.env.TREND_MIN_LIQ_USD || 8000); // Increased from 5000
+const TREND_MIN_VOL_24H_USD = Number(process.env.TREND_MIN_VOL_24H_USD || 8000); // Increased from 5000
+const TREND_MIN_TXNS_1H = Number(process.env.TREND_MIN_TXNS_1H || 30); // Increased from 25
 
-const TREND_ALERT_COOLDOWN_MIN = Number(process.env.TREND_ALERT_COOLDOWN_MIN || 45);
+const TREND_ALERT_COOLDOWN_MIN = Number(process.env.TREND_ALERT_COOLDOWN_MIN || 360); // Increased from 45 (now 6 hours)
 const TREND_HISTORY_MAX = Number(process.env.TREND_HISTORY_MAX || 120);
 
 function ensureWatchState(st) {
@@ -711,6 +827,10 @@ function shouldTrendAlert(watchItem, token) {
 }
 
 async function runTrendingTick() {
+  if (!ALERT_RUNNERS) {
+    console.log('📈 Trending tick skipped (ALERT_RUNNERS=0)');
+    return;
+  }
   if (!TRENDING_ENABLED) return;
 
   console.log("📈 Trending tick...");
@@ -777,10 +897,11 @@ async function runTrendingTick() {
     if (token.url) fields.push({ name: "📊 Chart", value: token.url, inline: false });
 
     await postToDiscord({
-      title: "📈 TRENDING UP (MCap/FDV)",
+      title: "📈 RUNNER ALERT (MCap/FDV Acceleration)",
       description: `**${token.symbol}** — ${token.name}\nAccelerating ${capLabel} over last ${TREND_WINDOW_MIN} minutes.`,
       fields,
       color: 0x00b7ff,
+      webhookUrl: DISCORD_WEBHOOK_URL_RUNNERS,
     });
 
     console.log(`  ✅ Trending alert sent: ${token.symbol} (+${verdict.pct.toFixed(1)}%/${TREND_WINDOW_MIN}m)`);
@@ -793,19 +914,20 @@ async function runTrendingTick() {
 
 // ---------- Early Move + Confirmed Pump (solves "late alerts") ----------
 const EARLY_MOVE_ENABLED = process.env.EARLY_MOVE_ENABLED !== "0";
-const EARLY_MOVE_5M_PCT = Number(process.env.EARLY_MOVE_5M_PCT || 2);
-const EARLY_MOVE_1H_PCT = Number(process.env.EARLY_MOVE_1H_PCT || 5);
-const EARLY_MOVE_MIN_LIQ = Number(process.env.EARLY_MOVE_MIN_LIQ || 1000);
-const EARLY_MOVE_MIN_TXNS_1H = Number(process.env.EARLY_MOVE_MIN_TXNS_1H || 20);
-const EARLY_MOVE_MIN_VOL_24H = Number(process.env.EARLY_MOVE_MIN_VOL_24H || 2500);
-const EARLY_ALERT_COOLDOWN_MIN = Number(process.env.EARLY_ALERT_COOLDOWN_MIN || 30);
+const EARLY_MOVE_5M_PCT = Number(process.env.EARLY_MOVE_5M_PCT || 5); // Increased from 2 - MUCH MORE SELECTIVE
+const EARLY_MOVE_1H_PCT = Number(process.env.EARLY_MOVE_1H_PCT || 10); // Increased from 5 - MUCH MORE SELECTIVE
+const EARLY_MOVE_MIN_LIQ = Number(process.env.EARLY_MOVE_MIN_LIQ || 5000); // Increased from 1000
+const EARLY_MOVE_MIN_TXNS_1H = Number(process.env.EARLY_MOVE_MIN_TXNS_1H || 30); // Increased from 20
+const EARLY_MOVE_MIN_VOL_24H = Number(process.env.EARLY_MOVE_MIN_VOL_24H || 5000); // Increased from 2500
+const EARLY_ALERT_COOLDOWN_MIN = Number(process.env.EARLY_ALERT_COOLDOWN_MIN || 360); // 6 HOURS instead of 30 min - NO MORE SPAM!
 
 const PUMP_ENABLED = process.env.PUMP_ENABLED !== "0";
-const PUMP_1H_PCT = Number(process.env.PUMP_1H_PCT || 20);
-const PUMP_MIN_LIQ = Number(process.env.PUMP_MIN_LIQ || 10000);
-const PUMP_MIN_TXNS_1H = Number(process.env.PUMP_MIN_TXNS_1H || 40);
-const PUMP_MIN_VOL_24H = Number(process.env.PUMP_MIN_VOL_24H || 10000);
-const PUMP_ALERT_COOLDOWN_MIN = Number(process.env.PUMP_ALERT_COOLDOWN_MIN || 45);
+const CONF_PUMP_5M_PCT = Number(process.env.CONF_PUMP_5M_PCT || 10); // Increased from 6
+const CONF_PUMP_1H_PCT = Number(process.env.CONF_PUMP_1H_PCT || 25); // Increased from 20
+const CONF_PUMP_MIN_LIQ = Number(process.env.CONF_PUMP_MIN_LIQ || 15000); // Increased from 10000
+const CONF_PUMP_MIN_TXNS_1H = Number(process.env.CONF_PUMP_MIN_TXNS_1H || 50); // Increased from 40
+const CONF_PUMP_MIN_VOL_24H = Number(process.env.CONF_PUMP_MIN_VOL_24H || 15000); // Increased from 10000
+const CONF_PUMP_ALERT_COOLDOWN_MIN = Number(process.env.CONF_PUMP_ALERT_COOLDOWN_MIN || 360); // 6 HOURS instead of 45 min - NO MORE SPAM!
 
 function ensurePumpState(st) {
   if (!st.pumps) st.pumps = {}; // token -> { lastEarlyAt, lastPumpAt }
@@ -838,11 +960,11 @@ function meetsConfirmedPump(token) {
   const ch1 = Number(token.priceChange1h || 0);
   const { total: t1h } = txns1h(token);
 
-  if (liq < PUMP_MIN_LIQ) return false;
-  if (vol24 < PUMP_MIN_VOL_24H) return false;
-  if (t1h < PUMP_MIN_TXNS_1H) return false;
+  if (liq < CONF_PUMP_MIN_LIQ) return false;
+  if (vol24 < CONF_PUMP_MIN_VOL_24H) return false;
+  if (t1h < CONF_PUMP_MIN_TXNS_1H) return false;
 
-  return (ch5 >= PUMP_5M_PCT) && (ch1 >= PUMP_1H_PCT);
+  return (ch5 >= CONF_PUMP_5M_PCT) && (ch1 >= CONF_PUMP_1H_PCT);
 }
 
 async function runPumpMonitorsTick(st) {
@@ -862,60 +984,86 @@ async function runPumpMonitorsTick(st) {
     await sleep(200);
     if (!token) continue;
 
-    if (!pumps[addr]) pumps[addr] = { lastEarlyAt: 0, lastPumpAt: 0 };
+    if (!pumps[addr]) pumps[addr] = { lastEarlyAt: 0, lastPumpAt: 0, lastEarlyPrice: 0, lastPumpPrice: 0 };
 
     if (EARLY_MOVE_ENABLED && pumpCooldownOk(pumps[addr].lastEarlyAt, EARLY_ALERT_COOLDOWN_MIN) && meetsEarlyMove(token)) {
-      pumps[addr].lastEarlyAt = Date.now();
-      earlySent++;
+      // Check if price moved enough from last alert to justify re-alert
+      const lastPrice = pumps[addr].lastEarlyPrice || 0;
+      const currentPrice = Number(token.price || 0);
+      const priceChangePct = lastPrice > 0 ? ((currentPrice - lastPrice) / lastPrice) * 100 : 999;
+      
+      // Only alert if it's first time OR price moved +10% from last alert
+      if (!lastPrice || priceChangePct >= REALERT_MIN_PRICE_CHANGE_PCT) {
+        pumps[addr].lastEarlyAt = Date.now();
+        pumps[addr].lastEarlyPrice = currentPrice;
+        earlySent++;
 
-      const { buys, sells, total } = txns1h(token);
-      const fields = [
-        { name: "⏰ Age", value: formatAge(token.pairCreatedAt), inline: true },
-        { name: "📈 5m", value: `${token.priceChange5m >= 0 ? "+" : ""}${Number(token.priceChange5m).toFixed(2)}%`, inline: true },
-        { name: "📈 1h", value: `${token.priceChange1h >= 0 ? "+" : ""}${Number(token.priceChange1h).toFixed(2)}%`, inline: true },
-        { name: "💧 Liq", value: formatCurrency(token.liquidity), inline: true },
-        { name: "📊 Vol 24h", value: formatCurrency(token.volume24h), inline: true },
-        { name: "🔄 Txns (1h)", value: `${total} (B:${buys}/S:${sells})`, inline: true },
-        { name: "Token", value: `\`${token.address}\``, inline: false },
-      ];
-      if (token.url) fields.push({ name: "📊 Chart", value: token.url, inline: false });
+        const { buys, sells, total } = txns1h(token);
+        const fields = [
+          { name: "⏰ Age", value: formatAge(token.pairCreatedAt), inline: true },
+          { name: "📈 5m", value: `${token.priceChange5m >= 0 ? "+" : ""}${Number(token.priceChange5m).toFixed(2)}%`, inline: true },
+          { name: "📈 1h", value: `${token.priceChange1h >= 0 ? "+" : ""}${Number(token.priceChange1h).toFixed(2)}%`, inline: true },
+          { name: "💧 Liq", value: formatCurrency(token.liquidity), inline: true },
+          { name: "📊 Vol 24h", value: formatCurrency(token.volume24h), inline: true },
+          { name: "🏷️ MCap", value: token.marketCap > 0 ? formatCurrency(token.marketCap) : "n/a", inline: true },
+          { name: "🔄 Txns (1h)", value: `${total} (B:${buys}/S:${sells})`, inline: true },
+          { name: "Token", value: `\`${token.address}\``, inline: false },
+        ];
+        if (token.url) fields.push({ name: "📊 Chart", value: token.url, inline: false });
 
-      await postToDiscord({
-        title: "🚨 EARLY MOVE ALERT",
-        description: `**${token.symbol}** — ${token.name}\nEarly momentum detected (baseline-free).`,
-        fields,
-        color: 0xf1c40f,
-      });
+        await postToDiscord({
+          title: "🚨 EARLY MOVE ALERT",
+          description: `**${token.symbol}** — ${token.name}\nEarly momentum detected (baseline-free).`,
+          fields,
+          color: 0xf1c40f,
+          webhookUrl: DISCORD_WEBHOOK_URL_RUNNERS,
+        });
 
-      console.log(`  🚨 Early move alert: ${token.symbol}`);
-      await sleep(250);
+        console.log(`  🚨 Early move alert: ${token.symbol}`);
+        await sleep(250);
+      } else {
+        console.log(`  ⏭️  Skipped early alert for ${token.symbol}: price only +${priceChangePct.toFixed(1)}% from last alert (need +${REALERT_MIN_PRICE_CHANGE_PCT}%)`);
+      }
     }
 
-    if (PUMP_ENABLED && pumpCooldownOk(pumps[addr].lastPumpAt, PUMP_ALERT_COOLDOWN_MIN) && meetsConfirmedPump(token)) {
-      pumps[addr].lastPumpAt = Date.now();
-      pumpSent++;
+    if (PUMP_ENABLED && pumpCooldownOk(pumps[addr].lastPumpAt, CONF_PUMP_ALERT_COOLDOWN_MIN) && meetsConfirmedPump(token)) {
+      // Check if price moved enough from last alert to justify re-alert
+      const lastPrice = pumps[addr].lastPumpPrice || 0;
+      const currentPrice = Number(token.price || 0);
+      const priceChangePct = lastPrice > 0 ? ((currentPrice - lastPrice) / lastPrice) * 100 : 999;
+      
+      // Only alert if it's first time OR price moved +10% from last alert
+      if (!lastPrice || priceChangePct >= REALERT_MIN_PRICE_CHANGE_PCT) {
+        pumps[addr].lastPumpAt = Date.now();
+        pumps[addr].lastPumpPrice = currentPrice;
+        pumpSent++;
 
-      const { buys, sells, total } = txns1h(token);
-      const fields = [
-        { name: "⏰ Age", value: formatAge(token.pairCreatedAt), inline: true },
-        { name: "📈 5m", value: `${token.priceChange5m >= 0 ? "+" : ""}${Number(token.priceChange5m).toFixed(2)}%`, inline: true },
-        { name: "📈 1h", value: `${token.priceChange1h >= 0 ? "+" : ""}${Number(token.priceChange1h).toFixed(2)}%`, inline: true },
-        { name: "💧 Liq", value: formatCurrency(token.liquidity), inline: true },
-        { name: "📊 Vol 24h", value: formatCurrency(token.volume24h), inline: true },
-        { name: "🔄 Txns (1h)", value: `${total} (B:${buys}/S:${sells})`, inline: true },
-        { name: "Token", value: `\`${token.address}\``, inline: false },
-      ];
-      if (token.url) fields.push({ name: "📊 Chart", value: token.url, inline: false });
+        const { buys, sells, total } = txns1h(token);
+        const fields = [
+          { name: "⏰ Age", value: formatAge(token.pairCreatedAt), inline: true },
+          { name: "📈 5m", value: `${token.priceChange5m >= 0 ? "+" : ""}${Number(token.priceChange5m).toFixed(2)}%`, inline: true },
+          { name: "📈 1h", value: `${token.priceChange1h >= 0 ? "+" : ""}${Number(token.priceChange1h).toFixed(2)}%`, inline: true },
+          { name: "💧 Liq", value: formatCurrency(token.liquidity), inline: true },
+          { name: "📊 Vol 24h", value: formatCurrency(token.volume24h), inline: true },
+          { name: "🏷️ MCap", value: token.marketCap > 0 ? formatCurrency(token.marketCap) : "n/a", inline: true },
+          { name: "🔄 Txns (1h)", value: `${total} (B:${buys}/S:${sells})`, inline: true },
+          { name: "Token", value: `\`${token.address}\``, inline: false },
+        ];
+        if (token.url) fields.push({ name: "📊 Chart", value: token.url, inline: false });
 
-      await postToDiscord({
-        title: "📈 PUMP ALERT!",
-        description: `**${token.symbol}** — ${token.name}\nConfirmed pump conditions met.`,
-        fields,
-        color: 0xe74c3c,
-      });
+        await postToDiscord({
+          title: "📈 PUMP ALERT!",
+          description: `**${token.symbol}** — ${token.name}\nConfirmed pump conditions met.`,
+          fields,
+          color: 0xe74c3c,
+          webhookUrl: DISCORD_WEBHOOK_URL_RUNNERS,
+        });
 
-      console.log(`  📈 Pump alert: ${token.symbol}`);
-      await sleep(250);
+        console.log(`  📈 Pump alert: ${token.symbol}`);
+        await sleep(250);
+      } else {
+        console.log(`  ⏭️  Skipped pump alert for ${token.symbol}: price only +${priceChangePct.toFixed(1)}% from last alert (need +${REALERT_MIN_PRICE_CHANGE_PCT}%)`);
+      }
     }
   }
 
